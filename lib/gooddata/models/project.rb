@@ -21,9 +21,14 @@ require_relative '../mixins/contributor'
 require_relative '../mixins/rest_resource'
 require_relative '../mixins/uri_getter'
 
+require_relative 'membership'
 require_relative 'process'
 require_relative 'project_role'
 require_relative 'blueprint/blueprint'
+
+require_relative 'metadata/scheduled_mail'
+require_relative 'metadata/scheduled_mail/dashboard_attachment'
+require_relative 'metadata/scheduled_mail/report_attachment'
 
 module GoodData
   class Project < Rest::Resource
@@ -87,6 +92,17 @@ module GoodData
         end
       end
 
+      # Clones project along with etl and schedules
+      #
+      # @param project [Project] Project to be cloned from
+      # @param [options] Options that are passed into project.clone
+      # @return [GoodData::Project] New cloned project
+      def clone_with_etl(project, options = {})
+        a_clone = project.clone(options)
+        GoodData::Project.transfer_etl(project.client, project, a_clone)
+        a_clone
+      end
+
       def create_object(data = {})
         c = client(data)
         new_data = GoodData::Helpers.deep_dup(EMPTY_OBJECT).tap do |d|
@@ -124,7 +140,7 @@ module GoodData
         project.save
         # until it is enabled or deleted, recur. This should still end if there is a exception thrown out from RESTClient. This sometimes happens from WebApp when request is too long
         while project.state.to_s != 'enabled'
-          if project.state.to_s == 'deleted'
+          if project.deleted?
             # if project is switched to deleted state, fail. This is usually problem of creating a template which is invalid.
             fail 'Project was marked as deleted during creation. This usually means you were trying to create from template and it failed.'
           end
@@ -168,6 +184,131 @@ module GoodData
           }
         }
       end
+
+      # Clones project along with etl and schedules.
+      #
+      # @param client [GoodData::Rest::Client] GoodData client to be used for connection
+      # @param from_project [GoodData::Project | GoodData::Segment | GoodData:Client | String] Object to be cloned from. Can be either segment in which case we take the master, client in which case we take its project, string in which case we treat is as an project object or directly project
+      def transfer_etl(client, from_project, to_project)
+        from_project = case from_project
+                       when GoodData::Client
+                         from_project.project
+                       when GoodData::Segment
+                         from_project.master_project
+                       else
+                         client.projects(from_project)
+                       end
+
+        to_project = case to_project
+                     when GoodData::Client
+                       to_project.project
+                     when GoodData::Segment
+                       to_project.master_project
+                     else
+                       client.projects(to_project)
+                     end
+
+        from_project.processes.each do |process|
+          Dir.mktmpdir('etl_transfer') do |dir|
+            dir = Pathname(dir)
+            filename = dir + 'process.zip'
+            File.open(filename, 'w') do |f|
+              f << process.download
+            end
+            to_process = to_project.processes.find { |p| p.name == process.name }
+            to_process ? to_process.deploy(filename, type: process.type, name: process.name) : to_project.deploy_process(filename, type: process.type, name: process.name)
+          end
+        end
+        res = (from_project.processes + to_project.processes).map { |p| [p, p.name, p.type] }
+        res.group_by { |x| [x[1], x[2]] }
+          .select { |_, procs| procs.length == 1 }
+          .flat_map { |_, procs| procs.select { |p| p[0].project.pid == to_project.pid }.map { |p| p[0] } }
+          .peach(&:delete)
+        transfer_schedules(from_project, to_project)
+      end
+
+      # Clones project along with etl and schedules.
+      #
+      # @param client [GoodData::Rest::Client] GoodData client to be used for connection
+      # @param from_project [GoodData::Project | GoodData::Segment | GoodData:Client | String] Object to be cloned from. Can be either segment in which case we take the master, client in which case we take its project, string in which case we treat is as an project object or directly project
+      def transfer_schedules(from_project, to_project)
+        cache = to_project.processes.sort_by(&:name).zip(from_project.processes.sort_by(&:name)).flat_map { |remote, local| local.schedules.map { |schedule| [remote, local, schedule] } }
+
+        remote_schedules = to_project.schedules
+        remote_stuff = remote_schedules.map do |s|
+          v = s.to_hash
+          after_schedule = remote_schedules.find { |s2| s.trigger_id == s2.obj_id }
+          v[:after] = s.trigger_id && after_schedule && after_schedule.name
+          v[:remote_schedule] = s
+          v[:params] = v[:params].except("EXECUTABLE", "PROCESS_ID")
+          v.compact
+        end
+
+        local_schedules = from_project.schedules
+        local_stuff = local_schedules.map do |s|
+          v = s.to_hash
+          after_schedule = local_schedules.find { |s2| s.trigger_id == s2.obj_id }
+          v[:after] = s.trigger_id && after_schedule && after_schedule.name
+          v[:remote_schedule] = s
+          v[:params] = v[:params].except("EXECUTABLE", "PROCESS_ID")
+          v.compact
+        end
+
+        diff = GoodData::Helpers.diff(remote_stuff, local_stuff, key: :name, fields: [:name, :cron, :after, :params, :hidden_params, :reschedule])
+        stack = diff[:added].map { |x| [:added, x] } + diff[:changed].map { |x| [:changed, x] }
+        schedule_cache = remote_schedules.reduce({}) do |a, e|
+          a[e.name] = e
+          a
+        end
+        messages = []
+        loop do
+          break if stack.empty?
+          state, changed_schedule = stack.shift
+          if state == :added
+            schedule_spec = changed_schedule
+            if schedule_spec[:after] && !schedule_cache[schedule_spec[:after]]
+              stack << [state, schedule_spec]
+              next
+            end
+            remote_process, process_spec = cache.find { |_remote, _local, schedule| schedule.name == schedule_spec[:name] }
+            messages << { message: "Creating schedule #{schedule_spec[:name]} for process #{remote_process.name}" }
+            executable = schedule_spec[:executable] || (process_spec["process_type"] == 'ruby' ? 'main.rb' : 'main.grf')
+            params = {
+              params: schedule_spec[:params].merge('PROJECT_ID' => to_project.pid),
+              hidden_params: schedule_spec[:hidden_params],
+              name: schedule_spec[:name],
+              reschedule: schedule_spec[:reschedule]
+            }
+            created_schedule = remote_process.create_schedule(schedule_spec[:cron] || schedule_cache[schedule_spec[:after]], executable, params)
+            schedule_cache[created_schedule.name] = created_schedule
+          else
+            schedule_spec = changed_schedule[:new_obj]
+            if schedule_spec[:after] && !schedule_cache[schedule_spec[:after]]
+              stack << [state, schedule_spec]
+              next
+            end
+            remote_process, process_spec = cache.find { |i| i[2].name == schedule_spec[:name] }
+            schedule = changed_schedule[:old_obj][:remote_schedule]
+            messages << { message: "Updating schedule #{schedule_spec[:name]} for process #{remote_process.name}" }
+            schedule.params = (schedule_spec[:params] || {})
+            schedule.cron = schedule_spec[:cron] if schedule_spec[:cron]
+            schedule.after = schedule_cache[schedule_spec[:after]] if schedule_spec[:after]
+            schedule.hidden_params = schedule_spec[:hidden_params] || {}
+            schedule.executable = schedule_spec[:executable] || (process_spec["process_type"] == 'ruby' ? 'main.rb' : 'main.grf')
+            schedule.reschedule = schedule_spec[:reschedule]
+            schedule.name = schedule_spec[:name]
+            schedule.save
+            schedule_cache[schedule.name] = schedule
+          end
+        end
+
+        diff[:removed].each do |removed_schedule|
+          messages << { message: "Removing schedule #{removed_schedule[:name]}" }
+          removed_schedule[:remote_schedule].delete
+        end
+        messages
+        # messages.map {|m| m.merge({custom_project_id: custom_project_id})}
+      end
     end
 
     def add_dashboard(dashboard)
@@ -175,6 +316,18 @@ module GoodData
     end
 
     alias_method :create_dashboard, :add_dashboard
+
+    def add_user_group(data)
+      g = GoodData::UserGroup.create(data.merge(project: self))
+
+      begin
+        g.save
+      rescue RestClient::Conflict
+        user_groups(data[:name])
+      end
+    end
+
+    alias_method :create_group, :add_user_group
 
     # Creates a metric in a project
     #
@@ -199,8 +352,8 @@ module GoodData
     # @param [options] Optional report options
     # @return [GoodData::Report] Instance of new report
     def add_report(options = {})
-      rep = GoodData::Report.create(options.merge(client: client, project: self))
-      rep.save
+      report = GoodData::Report.create(options.merge(client: client, project: self))
+      report.save
     end
 
     alias_method :create_report, :add_report
@@ -254,7 +407,7 @@ module GoodData
     #
     # @return [GoodData::ProjectRole] Project role if found
     def blueprint(options = {})
-      result = client.get("/gdc/projects/#{pid}/model/view", params: { includeDeprecated: true })
+      result = client.get("/gdc/projects/#{pid}/model/view", params: { includeDeprecated: true, includeGrain: true })
       polling_url = result['asyncTask']['link']['poll']
       model = client.poll_on_code(polling_url, options)
       bp = GoodData::Model::FromWire.from_wire(model)
@@ -339,6 +492,10 @@ module GoodData
       result['exportArtifact']['token']
     end
 
+    def user_groups(id = :all, options = {})
+      GoodData::UserGroup[id, options.merge(project: self)]
+    end
+
     # Imports a clone into current project. The project has to be freshly
     # created.
     #
@@ -392,8 +549,15 @@ module GoodData
 
     # Deletes project
     def delete
-      fail "Project '#{title}' with id #{uri} is already deleted" if state == :deleted
+      fail "Project '#{title}' with id #{uri} is already deleted" if deleted?
       client.delete(uri)
+    end
+
+    # Returns true if project is in deleted state
+    #
+    # @return [Boolean] Returns true if object deleted. False otherwise.
+    def deleted?
+      state == :deleted
     end
 
     # Helper for getting rid of all data in the project
@@ -819,12 +983,19 @@ module GoodData
       if projects.is_a?(Array)
         projects.each_slice(batch_size).flat_map do |batch|
           batch.pmap do |proj|
-            target_project = client.projects(proj)
             begin
+              target_project = client.projects(proj)
               target_project.objects_import(token, options)
               {
                 project: target_project,
                 result: true
+              }
+            rescue RestClient::Exception => e
+              {
+                project: proj,
+                exception: e,
+                result: false,
+                reason: GoodData::Helpers.interpolate_error_message(MultiJson.load(e.response))
               }
             rescue GoodData::ObjectsImportError => e
               {
@@ -999,6 +1170,15 @@ module GoodData
       self
     end
 
+    # Schedules an email with dashboard or report content
+    def schedule_mail(options = GoodData::ScheduledMail::DEFAULT_OPTS)
+      GoodData::ScheduledMail.create(options.merge(client: client, project: self))
+    end
+
+    def scheduled_mails(options = { :full => false })
+      GoodData::ScheduledMail[:all, options.merge(project: self, client: client)]
+    end
+
     # @param [String | Number | Object] Anything that you can pass to GoodData::Schedule[id]
     # @return [GoodData::Schedule | Array<GoodData::Schedule>] schedule instance or list
     def schedules(id = :all)
@@ -1082,7 +1262,7 @@ module GoodData
 
     alias_method :members, :users
 
-    def whitelist_users(new_users, users_list, whitelist)
+    def whitelist_users(new_users, users_list, whitelist, mode = :exclude)
       return [new_users, users_list] unless whitelist
 
       new_whitelist_proc = proc do |user|
@@ -1093,7 +1273,11 @@ module GoodData
         whitelist.any? { |wl| wl.is_a?(Regexp) ? user.login =~ wl : user.login.include?(wl) }
       end
 
-      [new_users.reject(&new_whitelist_proc), users_list.reject(&whitelist_proc)]
+      if mode == :include
+        [new_users.select(&new_whitelist_proc), users_list.select(&whitelist_proc)]
+      elsif mode == :exclude
+        [new_users.reject(&new_whitelist_proc), users_list.reject(&whitelist_proc)]
+      end
     end
 
     # Imports users
@@ -1105,6 +1289,9 @@ module GoodData
       GoodData.logger.warn("Importing users to project (#{pid})")
 
       whitelisted_new_users, whitelisted_users = whitelist_users(new_users.map(&:to_hash), users_list, options[:whitelists])
+
+      # First check that if groups are provided we have them set up
+      check_groups(new_users.map(&:to_hash).flat_map { |u| u[:user_group] || [] }.uniq)
 
       # conform the role on list of new users so we can diff them with the users coming from the project
       diffable_new_with_default_role = whitelisted_new_users.map do |u|
@@ -1151,6 +1338,30 @@ module GoodData
       to_remove = diff[:removed].reject { |user| user[:status] == 'DISABLED' || user[:status] == :disabled }
       GoodData.logger.warn("Removing #{to_remove.count} users from project (#{pid})")
       results.concat(disable_users(to_remove))
+
+      # reassign to groups
+      mappings = new_users.map(&:to_hash).flat_map do |user|
+        groups = user[:user_group] || []
+        groups.map { |g| [user[:login], g] }
+      end
+      unless mappings.empty?
+        users_lookup = users.reduce({}) do |a, e|
+          a[e.login] = e
+          a
+        end
+        mappings.group_by { |_, g| g }.each do |g, mapping|
+          # find group + set users
+          # CARE YOU DO NOT KNOW URI
+          user_groups(g).set_members(mapping.map { |user, _| user }.map { |login| users_lookup[login] && users_lookup[login].uri })
+        end
+        mentioned_groups = mappings.map(&:last).uniq
+        groups_to_cleanup = user_groups.reject { |g| mentioned_groups.include?(g.name) }
+        # clean all groups not mentioned with exception of whitelisted users
+        groups_to_cleanup.each do |g|
+          g.set_members(whitelist_users(g.members.map(&:to_hash), [], options[:whitelists], :include).first.map { |x| x[:uri] })
+        end
+      end
+      results
     end
 
     def disable_users(list)
@@ -1164,6 +1375,12 @@ module GoodData
         result = client.post(url, 'users' => payload)
         result['projectUsersUpdateResult'].mapcat { |k, v| v.map { |x| { type: k.to_sym, uri: x } } }
       end
+    end
+
+    def check_groups(specified_groups)
+      groups = user_groups.map(&:name)
+      missing_groups = specified_groups - groups
+      fail "All groups have to be specified before you try to import users. Groups that are currently in project are #{groups.join(',')} and you asked for #{missing_groups.join(',')}" unless missing_groups.empty?
     end
 
     # Update user
@@ -1180,7 +1397,6 @@ module GoodData
       fail ArgumentError, "User #{user_uri} could not be aded. #{failure.first['message']}" unless failure.blank?
       res
     end
-
     alias_method :add_user, :set_user_roles
 
     # Update list of users

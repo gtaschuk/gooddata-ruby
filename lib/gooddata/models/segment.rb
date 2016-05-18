@@ -116,6 +116,15 @@ module GoodData
     # Master project id getter for the Segment.
     #
     # @return [String] Project uri
+    def master_project_id
+      GoodData::Helpers.last_uri_part(master_project_uri)
+    end
+
+    alias_method :master_id, :master_project_id
+
+    # Master project uri getter for the Segment.
+    #
+    # @return [String] Project uri
     def master_project_uri
       data['masterProject']
     end
@@ -156,6 +165,9 @@ module GoodData
       self
     end
 
+    # Runs async process that walks thorugh segments and provisions projects if necessary.
+    #
+    # @return [Array] Returns array of results
     def synchronize_clients
       sync_uri = SYNCHRONIZE_URI % [domain.obj_id, id]
       res = client.post sync_uri, nil
@@ -171,9 +183,19 @@ module GoodData
     # Deletes a segment instance on the API.
     #
     # @return [GoodData::Segment] Segment instance
-    def delete
+    def delete(options = {})
+      force = options[:force] == true ? true : false
+      clients.peach(&:delete) if force
       client.delete(uri) if uri
       self
+    rescue RestClient::BadRequest => e
+      payload = GoodData::Helpers.parse_http_exception(e)
+      case GoodData::Helpers.get_path(payload)
+      when 'gdc.c4.conflict.domain.segment.contains_clients'
+        throw SegmentNotEmpty
+      else
+        raise e
+      end
     end
   end
 end

@@ -5,6 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 require 'pathname'
+require 'terminal-table'
+
+require_relative '../connection'
 
 module GoodData
   module Command
@@ -79,15 +82,7 @@ module GoodData
 
         # Update project
         def update(opts = { client: GoodData.connection })
-          client = opts[:client]
-          fail ArgumentError, 'No :client specified' if client.nil?
-
-          p = opts[:project]
-          fail ArgumentError, 'No :project specified' if p.nil?
-
-          project = GoodData::Project[p, opts]
-          fail ArgumentError, 'Wrong :project specified' if project.nil?
-
+          client, project = GoodData.get_client_and_project(opts)
           GoodData::Model::ProjectCreator.migrate(:spec => opts[:spec], :client => client, :project => project)
         end
 
@@ -113,25 +108,16 @@ module GoodData
 
           spin_session = proc do |goodfile, _blueprint|
             project_id = options[:project_id] || goodfile[:project_id]
-            message = 'You have to provide "project_id". You can either provide it through -p flag'\
-               'or even better way is to fill it in in your Goodfile under key "project_id".'\
-               'If you just started a project you have to create it first. One way might be'\
-               'through "gooddata project build"'
-            fail message if project_id.nil? || project_id.empty?
 
             begin
               require 'gooddata'
               client = GoodData.connect(options)
-
-              GoodData.with_project(project_id, :client => client) do |project|
-                fail ArgumentError, 'Wrong project specified' if project.nil?
-
-                puts "Use 'exit' to quit the live session. Use 'q' to jump out of displaying a large output."
-                binding.pry(:quiet => true, # rubocop:disable Lint/Debugger
-                            :prompt => [proc do |_target_self, _nest_level, _pry|
-                              'project_live_session: '
-                            end])
-              end
+              project = client.projects(project_id) if project_id
+              puts "Use 'exit' to quit the live session. Use 'q' to jump out of displaying a large output."
+              binding.pry(:quiet => true, # rubocop:disable Lint/Debugger
+                          :prompt => [proc do |_target_self, _nest_level, _pry|
+                            'project_live_session: '
+                          end])
             rescue GoodData::ProjectNotFound
               puts "Project with id \"#{project_id}\" could not be found. Make sure that the id you provided is correct."
             end
@@ -163,8 +149,25 @@ module GoodData
         # @param project_id [String | GoodData::Project] Project id or project instance to list the users in
         # @return [Array <GoodData::Membership>] List of project users
         def users(project_id, options = { client: GoodData.connection })
-          client = options[:client]
+          client = options[:client] || GoodData.connect(options)
           client.with_project(project_id, &:users)
+        end
+
+        # Lists users in a project
+        #
+        # @param options [Hash] List of users
+        #
+        # TODO: Review and refactor #users & #list_users
+        def list_users(options = { client: GoodData.connection })
+          client = GoodData.connect(options)
+          project = client.projects(options[:project_id])
+
+          rows = project.users.to_a.map do |user|
+            [user.email, user.full_name, user.role.title, user.user_groups.join(', ')]
+          end
+
+          table = Terminal::Table.new :headings => ['Email', 'Full Name', 'Role', 'Groups'], :rows => rows
+          puts table
         end
       end
     end

@@ -13,19 +13,19 @@ module GoodData
     end
 
     module ProcessHelper
-      set_const :PROCESS_ID, 'e4369e27-a6c7-4782-b4cb-a06b2e2db326'
+      set_const :PROCESS_ID, '93027bc3-c731-4788-a179-d83bd04aae35'
       set_const :DEPLOY_NAME, 'graph/graph.grf'
     end
 
     module ProjectHelper
-      set_const :PROJECT_ID, 'hq7ik4hpsaknrsvb07jz2adbci1iq5s8'
+      set_const :PROJECT_ID, 'yz7e0iwh7gdih02dssf47rw4e096t7nb'
       set_const :PROJECT_URL, "/gdc/projects/#{PROJECT_ID}"
       set_const :PROJECT_TITLE, 'GoodTravis'
       set_const :PROJECT_SUMMARY, 'No summary'
     end
 
     module ScheduleHelper
-      set_const :SCHEDULE_ID, '55ed6757e4b0d165852ab308'
+      set_const :SCHEDULE_ID, '571024efe4b025350e321b85'
     end
   end
 end

@@ -22,19 +22,16 @@ module GoodData
       end
 
       def create(options = { :client => GoodData.connection, :project => GoodData.project })
-        client = options[:client]
-        fail ArgumentError, 'No :client specified' if client.nil?
-
-        p = options[:project]
-        fail ArgumentError, 'No :project specified' if p.nil?
-
-        project = client.projects(p)
-        fail ArgumentError, 'Wrong :project specified' if project.nil?
+        client, project = GoodData.get_client_and_project(options)
 
         title = options[:title]
         fail 'Report needs a title specified' unless title
         summary = options[:summary] || ''
-        rd = options[:rd] || ReportDefinition.create(options)
+
+        options_rd = options.dup
+        options_rd.delete(:identifier)
+
+        rd = options[:rd] || ReportDefinition.create(options_rd)
         rd.save
 
         report = {

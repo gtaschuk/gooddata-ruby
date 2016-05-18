@@ -80,8 +80,8 @@ describe GoodData::Project, :constraint => 'slow' do
       @project.import_users(users, domain: @domain, whitelists: [/gem_tester@gooddata.com/])
       # it should be updated
       bill_changed = @domain.get_user(bill)
-      expect(bill_changed.first_name).to eql('buffalo')
-      expect(bill_changed.last_name).to eql('bill')
+      expect(bill_changed.first_name).to eq 'buffalo'
+      expect(bill_changed.last_name).to eq 'bill'
       expect(@project.members?(users)).to be_truthy
       expect(@project.members.count).to eq 3
       expect(@project.member?(bill_changed)).to be_truthy
@@ -115,7 +115,7 @@ describe GoodData::Project, :constraint => 'slow' do
       users_unchanged = users - [user_role_changed]
       new_role = users[1][:role] = users[1][:role] == "admin" ? "editor" : "admin"
       @project.import_users(users, domain: @domain, whitelists: [/gem_tester@gooddata.com/])
-      expect(@project.get_user(user_role_changed).role.identifier).to eql("#{new_role}Role")
+      expect(@project.get_user(user_role_changed).role.identifier).to eq "#{new_role}Role"
       expect(users_unchanged.map {|u| @project.get_user(u)}.map(&:role).map(&:title).uniq).to eq ['Editor']
     end
 
@@ -206,6 +206,26 @@ describe GoodData::Project, :constraint => 'slow' do
       expect(res.select { |r| r[:type] == :successful }.length).to equal(list.length)
       expect(logins.map {|l| users.find {|u| u.login == l}}.pmap {|u| u.role.title}).to eq roles.flatten
       
+    end
+
+    it 'can work with groups as well. Groups have to be set up. It can only eat hashes on input in this case' do
+      users = (1..5).to_a.map { |x| ProjectHelper.create_random_user(@client).to_hash }
+      group_names = ['group_1', 'group_2']
+      groups = group_names.map { |g| @project.create_group(name: g) }
+      users_with_groups = users.map { |u| u[:user_group] = groups.take(rand(2) + 1).map(&:name); u}
+      @domain.create_users(users_with_groups, domain: @domain)
+      @project.import_users(users_with_groups, domain: @domain, whitelists: [/gem_tester@gooddata.com/])
+      expect(users_with_groups.flat_map { |u| u[:user_group].map { |g| [u[:login], g] } }.all? do |u, g|
+        @project.user_groups(g).member?(@project.member(u).uri) rescue false
+      end).to be_truthy
+
+      users_with_group = users.map { |u| u[:user_group] = ['group_1']; u}
+      to_whitelist = @project.user_groups('group_2').members.to_a.sample
+      @project.import_users(users_with_group, domain: @domain, whitelists: [to_whitelist.login, /gem_tester@gooddata.com/])
+      expect(@project.user_groups('group_2').members.map(&:login)).to eq [to_whitelist.login]
+      expect(users_with_group.flat_map { |u| u[:user_group].map { |g| [u[:login], g] } }.all? do |u, g|
+        @project.user_groups(g).member?(@project.member(u).uri) rescue false
+      end).to be_truthy
     end
   end
 

@@ -14,6 +14,8 @@ module GoodData
   class Domain < Rest::Resource
     attr_reader :name
 
+    ProvisioningResult = Struct.new('ProvisioningResult', :id, :status, :project_uri, :error)
+
     class << self
       # Looks for domain
       #
@@ -186,7 +188,7 @@ module GoodData
         url = "#{domain.uri}/users?login=#{escaped_login}"
         tmp = c.get url
         items = tmp['accountSettings']['items'] if tmp['accountSettings']
-        items && items.length > 0 ? c.factory.create(GoodData::Profile, items.first) : nil
+        items && !items.empty? ? c.factory.create(GoodData::Profile, items.first) : nil
       end
 
       # Returns list of users for domain specified
@@ -274,12 +276,23 @@ module GoodData
       GoodData::Domain.add_user(data, name, { client: client }.merge(opts))
     end
 
-    def clients
+    # Returns all the clients defined in all segments defined in domain. Alternatively
+    # id of a client can be provided in which case it returns just that client
+    # if it exists.
+    #
+    # @param id [String] Id of client that you are looking for
+    # @return [Object] Raw response
+    #
+    def clients(id = :all)
       clients_uri = "/gdc/domains/#{name}/clients"
       res = client.get(clients_uri)
       res_clients = (res['clients'] && res['clients']['items']) || []
-      res_clients.map do |res_client|
-        client.create(GoodData::Client, res_client)
+      if id == :all
+        res_clients.map { |res_client| client.create(GoodData::Client, res_client) }
+      else
+        find_result = res_clients.find { |c| c['client']['id'] == id }
+        fail "Client with id #{id} was not found" unless find_result
+        client.create(GoodData::Client, find_result)
       end
     end
 
@@ -356,6 +369,69 @@ module GoodData
       profiles.map { |p| member?(p, list) }
     end
 
+    # Returns uri for segments on the domain. This will be removed soon. It is here that for segments the "account" portion of the URI was removed. And not for the rest
+    #
+    # @return [String] Uri of the segments
+    def segments_uri
+      "/gdc/domains/#{name}"
+    end
+
+    # Calls Segment#synchronize_clients on all segments and concatenates the results
+    #
+    # @return [Array] Returns array of results
+    def synchronize_clients
+      segments.flat_map(&:synchronize_clients)
+    end
+
+    # Runs async process that walks through segments and provisions projects if necessary.
+    #
+    # @return [Enumerator] Returns Enumerator of results
+    def provision_client_projects
+      res = client.post(segments_uri + '/provisionClientProjects', nil)
+      res = client.poll_on_code(res['asyncTask']['links']['poll'])
+      failed_count = GoodData::Helpers.get_path(res, %w(clientProjectProvisioningResult failed count), 0)
+      created_count = GoodData::Helpers.get_path(res, %w(clientProjectProvisioningResult created count), 0)
+      return Enumerator.new([]) if failed_count + created_count == 0
+      Enumerator.new do |y|
+        uri = GoodData::Helpers.get_path(res, %w(clientProjectProvisioningResult links details))
+        loop do
+          result = client.get(uri)
+          (GoodData::Helpers.get_path(result, %w(clientProjectProvisioningResultDetails items)) || []).each do |item|
+            y << ProvisioningResult.new(item['id'], item['status'], item['project'], item['error'])
+          end
+          uri = GoodData::Helpers.get_path(res, %w(clientProjectProvisioningResultDetails paging next))
+          break if uri.nil?
+        end
+      end
+    end
+
+    def update_clients(data, options = {})
+      delete_projects = options[:delete_projects] == false ? false : true
+      payload = data.map do |datum|
+        {
+          :client => {
+            :id => datum[:id],
+            :segment => segments_uri + '/segments/' + datum[:segment]
+          }
+        }.tap do |h|
+          h[:client][:project] = datum[:project] if datum.key?(:project)
+        end
+      end
+      if options[:delete_extra] == true
+        res = client.post(segments_uri + '/updateClients?deleteExtra=true', updateClients: { items: payload })
+      else
+        res = client.post(segments_uri + '/updateClients', updateClients: { items: payload })
+      end
+      data = GoodData::Helpers.get_path(res, ['updateClientsResponse'])
+      if data
+        result = data.flat_map { |k, v| v.map { |h| GoodData::Helpers.symbolize_keys(h.merge('type' => k)) } }
+        result.select { |r| r[:status] == 'DELETED' }.peach { |r| r[:originalProject] && client.delete(r[:originalProject]) } if delete_projects
+        result
+      else
+        []
+      end
+    end
+
     # Update user in domain
     #
     # @param opts [Hash] Data of the user to be updated
@@ -389,13 +465,6 @@ module GoodData
     # @return [String] Uri of the segments
     def uri
       "/gdc/account/domains/#{name}"
-    end
-
-    # Returns uri for segments on the domain. This will be removed soon. It is here that for segments the "account" portion of the URI was removed. And not for the rest
-    #
-    # @return [String] Uri of the segments
-    def segments_uri
-      "/gdc/domains/#{name}"
     end
 
     private

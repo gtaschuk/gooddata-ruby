@@ -52,15 +52,8 @@ module GoodData
         query('projectDashboard', Dashboard, options)
       end
 
-      def create(dashboard = {}, options = {:client => GoodData.client, :project => GoodData.project})
-        client = options[:client]
-        fail ArgumentError, 'No :client specified' if client.nil?
-
-        p = options[:project]
-        fail ArgumentError, 'No :project specified' if p.nil?
-
-        project = GoodData::Project[p, options]
-        fail ArgumentError, 'Wrong :project specified' if project.nil?
+      def create(dashboard = {}, options = { :client => GoodData.client, :project => GoodData.project })
+        client, project = GoodData.get_client_and_project(options)
 
         res = client.create(Dashboard, GoodData::Helpers.deep_dup(GoodData::Helpers.deep_stringify_keys(EMPTY_OBJECT)), :project => project)
         dashboard.each do |k, v|
@@ -88,7 +81,7 @@ module GoodData
       tab = options[:tab] || ''
 
       req_uri = "/gdc/projects/#{project.pid}/clientexport"
-      x = client.post(req_uri, 'clientExport' => { 'url' => "#{client.connection.server_url}/dashboard.html#project=#{GoodData.project.uri}&dashboard=#{uri}&tab=#{tab}&export=1", 'name' => title })
+      x = client.post(req_uri, 'clientExport' => { 'url' => "#{client.connection.server_url}/dashboard.html#project=#{project.uri}&dashboard=#{uri}&tab=#{tab}&export=1", 'name' => title })
       client.poll_on_code(x['asyncTask']['link']['poll'], options.merge(process: false))
     end
 

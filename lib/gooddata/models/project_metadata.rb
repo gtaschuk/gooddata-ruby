@@ -12,22 +12,24 @@ module GoodData
       end
 
       def [](key, opts = { :client => GoodData.connection, :project => GoodData.project })
-        client = opts[:client]
-        fail ArgumentError, 'No :client specified' if client.nil?
+        client, project = GoodData.get_client_and_project(opts)
 
-        project = opts[:project]
-        fail ArgumentError, 'No :project specified' if project.nil?
+        get_opts = {
+          do_not_log: [
+            RestClient::ResourceNotFound
+          ]
+        }
 
         if key == :all
           uri = "/gdc/projects/#{project.pid}/dataload/metadata"
-          res = client.get(uri)
+          res = client.get(uri, get_opts)
           res['metadataItems']['items'].reduce({}) do |memo, i|
             memo[i['metadataItem']['key']] = i['metadataItem']['value']
             memo
           end
         else
           uri = "/gdc/projects/#{project.pid}/dataload/metadata/#{key}"
-          res = client.get(uri)
+          res = client.get(uri, get_opts)
           res['metadataItem']['value']
         end
       end
@@ -43,11 +45,7 @@ module GoodData
       end
 
       def []=(key, opts = { :client => GoodData.connection, :project => GoodData.project }, val = nil)
-        client = opts[:client]
-        fail ArgumentError, 'No :client specified' if client.nil?
-
-        project = opts[:project]
-        fail ArgumentError, 'No :project specified' if project.nil?
+        client, project = GoodData.get_client_and_project(opts)
 
         data = {
           :metadataItem => {
